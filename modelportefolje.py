@@ -43,13 +43,13 @@ KANDIDATER = [
      "Faldet til 5,7% af MSCI World fra 11,3% i 2006. Egen cyklus, selskabsledelsesreform."),
     ("Region",  "Xact OMXC25",                   "XACTOMXC25.CO", "DK0061026940", 0.20, None,
      "Home bias. 25 selskaber og meget koncentreret — hold vægten lille."),
-    ("Satellit","iShares Global Infrastructure", "INFR.DE", "IE00B1FZS467", 0.65, None,
+    ("Satellit","iShares Global Infrastructure", "HMWA.L", "IE00B1FZS467", 0.65, None,
      "Regulerede pengestrømme og lav beta. Den reelle stabilisator i en aktieportefølje."),
     ("Satellit","Xtrackers World Health Care",   "XDWH.DE", "IE00BM67HK77", 0.25, None,
      "Deratet sektor med lav følsomhed over for AI-temaet. Ballast uden obligationer."),
     ("Satellit","VanEck Defense",                "DFNS.DE", "IE000YYE6WK5", 0.55, None,
      "Politisk drevet efterspørgsel, cirka ukorreleret med industricyklussen."),
-    ("Satellit","Xtrackers Electrification",     "WIRE.DE", "IE000UQND7H4", 0.35, None,
+    ("Satellit","Xtrackers Electrification",     "INFR.L", "IE000UQND7H4", 0.35, None,
      "AI-flaskehalsen bredere end uran: net, transformatorer, energilagring."),
 ]
 TICKER = {n: t for _, n, t, _, _, _, _ in KANDIDATER}
