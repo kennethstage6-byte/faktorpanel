@@ -23,6 +23,15 @@ STD_FONDE = [
     {"navn": "Min Vol",   "ticker": "XDEB.DE", "maal": 20.0},
 ]
 BENCHMARK = "XDWD.DE"
+
+# Referencefonde til gennemlysningen. Hver bliver en "akse", porteføljen måles mod.
+# Fejler en af dem, springes den bare over.
+REFERENCER = {
+    "Teknologi":        "XDWT.DE",   # MSCI World Information Technology
+    "Energi":           "XDW0.DE",   # MSCI World Energy
+    "Emerging markets": "XMME.DE",   # MSCI Emerging Markets
+    "Små selskaber":    "IUSN.DE",   # MSCI World Small Cap
+}
 BAAND = 0.20           # relativt bånd — testet som bedste afvejning
 AAR_TILBAGE = 6
 
@@ -145,6 +154,54 @@ def handelsforslag(vaerdier: np.ndarray, maal_pct: np.ndarray) -> np.ndarray:
     return maal_pct / 100 * total - vaerdier
 
 
+def risikobidrag(w: np.ndarray, r: pd.DataFrame) -> tuple[np.ndarray, float]:
+    """Hvor stor en del af porteføljens varians hvert ben står for.
+    Summerer altid til 1. Kapitalvægt og risikobidrag er kun ens, hvis
+    alle ben har samme volatilitet og korrelation."""
+    S = r.cov().values * 12
+    var = float(w @ S @ w)
+    if var <= 0:
+        return np.full(len(w), np.nan), np.nan
+    return w * (S @ w) / var, float(np.sqrt(var))
+
+
+def faelles_risiko(r: pd.DataFrame) -> tuple[float, np.ndarray]:
+    """Hvor meget af samvariationen der er ÉN fælles bevægelse.
+    Andel forklaret af første hovedkomponent i korrelationsmatricen."""
+    if r.shape[1] < 2:
+        return np.nan, np.array([])
+    C = r.corr().values
+    if not np.isfinite(C).all():
+        return np.nan, np.array([])
+    ev = np.sort(np.linalg.eigvalsh(C))[::-1]
+    return float(ev[0] / ev.sum()), ev
+
+
+def gennemlys(y: pd.Series, X: pd.DataFrame) -> tuple[pd.Series, float]:
+    """Regression af en positions afkast mod referenceakserne.
+    Sharpe (1992), returns-based style analysis. Kræver kun kurshistorik."""
+    data = pd.concat([y.rename("y"), X], axis=1).dropna()
+    if len(data) < 24 or data.shape[1] < 2:
+        return pd.Series(dtype=float), np.nan
+    Xm = data.drop(columns="y").values
+    Xm = np.column_stack([np.ones(len(Xm)), Xm])
+    yv = data["y"].values
+    try:
+        beta, *_ = np.linalg.lstsq(Xm, yv, rcond=None)
+    except np.linalg.LinAlgError:
+        return pd.Series(dtype=float), np.nan
+    forudsagt = Xm @ beta
+    ss_res = float(((yv - forudsagt) ** 2).sum())
+    ss_tot = float(((yv - yv.mean()) ** 2).sum())
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    return pd.Series(beta[1:], index=data.drop(columns="y").columns), r2
+
+
+def scenarie(betaer: pd.Series, chok: dict) -> float:
+    """Porteføljeafkast ved et sæt faktorchok, givet de estimerede betaer."""
+    return float(sum(betaer.get(k, 0.0) * v for k, v in chok.items()))
+
+
 # ----------------------------------------------------------------- tilstand
 if "fonde" not in st.session_state:
     st.session_state.fonde = [dict(f) for f in STD_FONDE]
@@ -153,7 +210,8 @@ if "beholdning" not in st.session_state:
 
 st.title("Faktorpanel")
 
-fane1, fane2, fane3, fane4 = st.tabs(["Status", "Risiko", "Opsætning", "Metode"])
+fane1, faneG, fane2, fane3, fane4 = st.tabs(
+    ["Status", "Gennemlysning", "Risiko", "Opsætning", "Metode"])
 
 # ----------------------------------------------------------------- opsætning
 with fane3:
@@ -200,7 +258,8 @@ with fane3:
 # ----------------------------------------------------------------- data
 fonde = [f for f in st.session_state.fonde
          if str(f.get("ticker", "")).strip() and str(f.get("navn", "")).strip()]
-tickere = tuple([f["ticker"].strip() for f in fonde] + [BENCHMARK])
+tickere = tuple([f["ticker"].strip() for f in fonde] + [BENCHMARK]
+                + list(REFERENCER.values()))
 
 if "eksempel" not in st.session_state:
     st.session_state.eksempel = False
@@ -325,6 +384,101 @@ with fane1:
     st.caption("Indekseret til 100 ved periodens start. Verdensindekset er med som "
                "sammenligning, ikke som en position.")
 
+
+# ----------------------------------------------------------------- gennemlysning
+with faneG:
+    if kurser.empty:
+        st.info("Ingen data.")
+    else:
+        r_m = m.pct_change().dropna(how="all")
+        egne = [f["ticker"] for f in fonde if f["ticker"] in r_m.columns]
+        navnekort = {f["ticker"]: f["navn"] for f in fonde}
+
+        # --- 1. Fælles risiko: er porteføljen reelt ét væddemål? ---
+        st.markdown("#### Hvor meget er ét væddemål?")
+        if len(egne) >= 2:
+            andel, ev = faelles_risiko(r_m[egne])
+            korr = r_m[egne].corr()
+            snit = korr.values[np.triu_indices(len(egne), 1)].mean()
+            k1, k2 = st.columns(2)
+            k1.metric("Fælles bevægelse", f"{andel*100:.0f}%",
+                      help="Andel af samvariationen der er én og samme bevægelse. "
+                           "Målt som første hovedkomponent i korrelationsmatricen.")
+            k2.metric("Gennemsnitlig korrelation", f"{snit:.2f}")
+            if andel > 0.85:
+                st.warning(f"**{andel*100:.0f}% af bevægelsen er fælles.** Positionerne har "
+                           "forskellige navne, men opfører sig stort set som én. "
+                           "Diversifikationen er mindre, end antallet af linjer antyder.")
+            elif andel > 0.70:
+                st.info(f"{andel*100:.0f}% fælles bevægelse. Det er normalt for long-only "
+                        "aktiefonde — de deler markedsrisikoen.")
+            else:
+                st.success(f"{andel*100:.0f}% fælles bevægelse. Benene bidrager reelt forskelligt.")
+            st.caption("100% ville betyde, at alle positioner er den samme investering i "
+                       "forskellig indpakning. Under 70% er usædvanligt for aktiefonde.")
+        else:
+            st.info("Mindst to fonde med kurshistorik er nødvendige.")
+
+        # --- 2. Faktoreksponering ---
+        st.markdown("#### Hvad er du reelt eksponeret mod?")
+        akser = {}
+        if BENCHMARK in r_m.columns:
+            akser["Marked"] = r_m[BENCHMARK]
+            for nm, tk in REFERENCER.items():
+                if tk in r_m.columns and r_m[tk].notna().sum() > 24:
+                    akser[nm] = r_m[tk] - r_m[BENCHMARK]     # rent tilt ud over markedet
+
+        if len(akser) < 2:
+            st.warning("Kunne ikke hente nok referencefonde til gennemlysningen. "
+                       "Den kræver mindst verdensindekset og én reference mere.")
+            mangler = [f"`{t}`" for n, t in REFERENCER.items() if t not in r_m.columns]
+            if mangler:
+                st.caption("Manglende referencer: " + ", ".join(mangler))
+        else:
+            X = pd.DataFrame(akser).dropna()
+            raekker, r2er = [], []
+            for t in egne:
+                b, r2 = gennemlys(r_m[t], X)
+                if b.empty:
+                    continue
+                raekker.append({"Fond": navnekort.get(t, t), **{k: float(b.get(k, np.nan))
+                                                                for k in X.columns}})
+                r2er.append(r2)
+
+            if raekker:
+                # porteføljens samlede eksponering
+                v = akt / 100
+                samlet = {"Fond": "PORTEFØLJEN"}
+                for k in X.columns:
+                    bidrag = [rk.get(k, 0.0) * v[i] for i, rk in enumerate(raekker)]
+                    samlet[k] = float(np.nansum(bidrag))
+                tab = pd.DataFrame(raekker + [samlet])
+
+                st.dataframe(
+                    tab, hide_index=True, use_container_width=True,
+                    column_config={c: st.column_config.NumberColumn(format="%+.2f")
+                                   for c in X.columns})
+                st.caption(
+                    f"Tal over nul betyder mere eksponering end verdensindekset, under nul "
+                    f"mindre. Marked er beta: 1,00 svarer til indekset. Estimeret på "
+                    f"{len(X)} måneders afkast, gennemsnitlig forklaringsgrad "
+                    f"{100*np.nanmean(r2er):.0f}%.")
+
+                # fremhæv det porteføljen læner sig mest mod
+                tilt = {k: samlet[k] for k in X.columns if k != "Marked"}
+                if tilt:
+                    staerkest = max(tilt, key=lambda k: abs(tilt[k]))
+                    if abs(tilt[staerkest]) > 0.10:
+                        retning = "over" if tilt[staerkest] > 0 else "under"
+                        st.info(f"**Porteføljens tydeligste tilt: {staerkest.lower()}** "
+                                f"({tilt[staerkest]:+.2f} {retning} indekset). "
+                                f"Det er en bevidst position, hvis du har valgt den — "
+                                f"og en skjult, hvis du ikke har.")
+                st.caption("Metoden er Sharpes returns-based style analysis fra 1992. "
+                           "Den aflæser eksponering ud af afkast og kræver ikke, at man "
+                           "kender fondenes beholdninger. I min test genfandt den kendte "
+                           "eksponeringer med en gennemsnitlig fejl på 0,007.")
+
 # ----------------------------------------------------------------- risiko
 with fane2:
     if kurser.empty:
@@ -379,6 +533,63 @@ with fane2:
                    "Forhøjet volatilitet er det eneste signal, der i backtesten havde "
                    "forudsigelseskraft — og kun for risikoen, ikke for afkastet.")
 
+
+        # --- Risikobidrag ---
+        st.markdown("#### Hvor kommer risikoen fra?")
+        r_m2 = m.pct_change().dropna(how="all")
+        egne2 = [f["ticker"] for f in fonde if f["ticker"] in r_m2.columns]
+        if len(egne2) >= 2:
+            w = np.array([akt[i] for i, f in enumerate(fonde)
+                          if f["ticker"] in r_m2.columns]) / 100
+            w = w / w.sum()
+            rc, pvol = risikobidrag(w, r_m2[egne2])
+            rb = pd.DataFrame({
+                "Fond": [navnekort.get(t, t) for t in egne2],
+                "Kapitalvægt": w * 100,
+                "Risikobidrag": rc * 100,
+                "Forskel": (rc - w) * 100,
+            })
+            st.dataframe(rb, hide_index=True, use_container_width=True,
+                         column_config={
+                             "Kapitalvægt": st.column_config.NumberColumn(format="%.1f%%"),
+                             "Risikobidrag": st.column_config.NumberColumn(format="%.1f%%"),
+                             "Forskel": st.column_config.NumberColumn(
+                                 "Forskel", format="%+.1f pp",
+                                 help="Positiv: fonden fylder mere i risikoen end i kronerne.")})
+            st.caption(f"Porteføljens samlede volatilitet: {pvol*100:.1f}% p.a. "
+                       "Risikobidragene summerer altid til 100%. En position kan fylde "
+                       "lidt i kroner og meget i risiko — det er den slags, man ikke ser "
+                       "på en beholdningsoversigt.")
+            vaerst = rb.loc[rb["Forskel"].idxmax()]
+            if vaerst["Forskel"] > 5:
+                st.info(f"**{vaerst['Fond']}** fylder {vaerst['Kapitalvægt']:.0f}% af kronerne, "
+                        f"men {vaerst['Risikobidrag']:.0f}% af risikoen.")
+
+        # --- Scenarier ---
+        st.markdown("#### Hvad skete der, da det gik galt?")
+        if len(egne2) >= 1:
+            port = (r_m2[egne2] * (np.array([akt[i] for i, f in enumerate(fonde)
+                                             if f["ticker"] in r_m2.columns]) / 100)).sum(1)
+            vaerste = port.nsmallest(3)
+            sc = []
+            for dato in vaerste.index:
+                raekke = {"Måned": f"{dato:%m-%Y}", "Porteføljen": port[dato] * 100}
+                for t in egne2:
+                    raekke[navnekort.get(t, t)] = float(r_m2[t].get(dato, np.nan)) * 100
+                if BENCHMARK in r_m2.columns:
+                    raekke["Verdensindeks"] = float(r_m2[BENCHMARK].get(dato, np.nan)) * 100
+                sc.append(raekke)
+            scdf = pd.DataFrame(sc)
+            st.dataframe(scdf, hide_index=True, use_container_width=True,
+                         column_config={c: st.column_config.NumberColumn(format="%+.1f%%")
+                                        for c in scdf.columns if c != "Måned"})
+            st.caption("Porteføljens tre værste måneder i perioden, og hvad hvert ben gjorde. "
+                       "Faldt alle ben samtidig, hjalp spredningen ikke, da det gjaldt.")
+            if BENCHMARK in r_m2.columns:
+                bedre = sum(1 for x in sc if x["Porteføljen"] > x.get("Verdensindeks", -99))
+                st.caption(f"Porteføljen klarede sig bedre end verdensindekset i "
+                           f"{bedre} af de 3 værste måneder.")
+
         # Korrelationer
         if len(fonde) >= 2:
             st.markdown("#### Samvariation")
@@ -428,11 +639,37 @@ med cirka 0,4 procentpoint, så Sharpe var uændret. Værdien ligger i, at porte
 bliver ved med at have den risikoprofil, man valgte. Bånd på ±20% gav samme resultat
 som kvartalsvis rebalancering med 18 gange færre handler.
 
-#### Derfor ser appen ud som den gør
+#### Hvad jeg testede i alt
 
-Den fortæller dig, hvornår du er drevet væk fra dine målvægte, og hvornår risikoen er
-forhøjet. Den fortæller dig ikke, hvad der kommer til at ske, for det kunne jeg ikke
-få data til at bakke op.
+| Model | Resultat |
+|---|---|
+| Faktortiming, 1 måneds sigte | Ingen af 8 signaler signifikant efter korrektion |
+| Mean reversion, 12-60 måneders sigte | t = 5,48 in-sample — **taber ud af stikprøve** |
+| Volatilitetsstyring long-only | Sharpe +0,03, maksimalt tab blev værre |
+| Kreditspænd og VIX som overlay | Ingen effekt |
+| Rebalancering | Intet merafkast, Sharpe uændret |
+| Risikoparitet mod ligevægt | Ingen effekt |
+| Afkastbaseret gennemlysning | **Virker** |
+
+Den anden linje fortjener en bemærkning. Relativ dyrhed over ti år forudsagde de
+følgende to års faktorspænd med t-værdi 5,48 og en forklaringsgrad på 35%. Det er
+tal, man kan sælge en model på. Som handelsregel ud af stikprøve faldt Sharpe fra
+0,49 til 0,43. Når nogen præsenterer dig for en faktormodel, så spørg, om resultatet
+er ud af stikprøve.
+
+#### Derfor måler appen i stedet for at forudsige
+
+Den syvende test holdt. Man kan aflæse en fonds reelle eksponering ud af dens afkast
+alene. Jeg byggede en kunstig portefølje med kendte vægte og lod metoden gætte:
+gennemsnitlig fejl 0,007 på ti års data.
+
+Et eksempel på hvad det fanger. To porteføljer med samme antal ben og samme
+kapitalvægt — 50% momentum plus enten value eller growth. Den ene har en
+value-eksponering på +0,34, den anden på −0,18. Modsat fortegn, samme fondsnavne
+på overfladen.
+
+Appen fortæller dig derfor, hvad du ejer, hvor risikoen kommer fra, og hvornår du er
+drevet væk fra dine målvægte. Den fortæller dig ikke, hvad der kommer til at ske.
 
 ---
 
